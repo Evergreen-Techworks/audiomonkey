@@ -132,6 +132,22 @@ To update later: `git pull && npm install --omit=dev && sudo systemctl restart a
 
 ---
 
+## 🍪 YouTube access (cookies)
+
+YouTube blocks requests from datacenter/cloud IPs with a "Sign in to confirm
+you're not a bot" wall. audiomonkey gets around it with a **pool of YouTube
+account cookies**: drop one Netscape-format cookies file per account in
+[`cookies/`](./cookies) (`*.txt`). The bot rotates through them and automatically
+puts any that get bot-walled on a cooldown, retrying them once they recover.
+
+- No cookies configured → it runs bare (fine from a home IP, usually blocked on cloud).
+- See [`cookies/README.md`](./cookies/README.md) for how to export a cookies file.
+- `/stats` shows how many cookies are available vs. cooling down.
+
+> Cookie files are account secrets — they're gitignored and never committed.
+
+---
+
 ## 📊 Usage stats
 
 audiomonkey keeps lightweight counters (tracks played, searches, commands,

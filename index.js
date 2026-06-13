@@ -1,6 +1,7 @@
 'use strict';
 
 const { spawn } = require('node:child_process');
+const path = require('node:path');
 const {
   Client,
   GatewayIntentBits,
@@ -21,16 +22,16 @@ const {
   getVoiceConnection,
 } = require('@discordjs/voice');
 const stats = require('./stats');
+const cookies = require('./cookies');
 
-const BRAND = 0x14b8a6; // teal accent for embeds
-
-// Server (guild) ID where the private /stats command is registered + allowed.
+const BRAND = 0x14b8a6;
 const STATS_GUILD_ID = process.env.STATS_GUILD_ID;
 
-// Slash commands need no privileged intents — just guild + voice state.
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
+
+const isBotWall = (m = '') => /not a bot|sign in to confirm/i.test(m);
 
 // --- Per-guild music state --------------------------------------------------
 
@@ -41,25 +42,22 @@ function getQueue(guildId) {
   if (q) return q;
 
   q = {
-    tracks: [],      // upcoming { title, url }
-    current: null,   // the track currently playing
+    tracks: [],
+    current: null,
     playing: false,
     textChannel: null,
-    // NoSubscriberBehavior.Play: keep transmitting even if the subscription
-    // isn't "active" at the exact instant play() is called — without this the
-    // player silently pauses and you hear nothing.
+    // Play even if a subscriber isn't "active" the instant play() is called,
+    // otherwise the player silently pauses and you hear nothing.
     player: createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } }),
   };
 
   q.player.on('stateChange', (o, n) => console.log(`[player] ${o.status} -> ${n.status}`));
   q.player.on(AudioPlayerStatus.Idle, () => {
-    q.current = null;
-    playNext(guildId);
+    playNext(guildId).catch((e) => console.error('[playNext]', e.message));
   });
   q.player.on('error', (err) => {
     console.error(`[player ${guildId}]`, err.message);
-    q.current = null;
-    playNext(guildId);
+    playNext(guildId).catch((e) => console.error('[playNext]', e.message));
   });
 
   queues.set(guildId, q);
@@ -68,16 +66,17 @@ function getQueue(guildId) {
 
 // --- YouTube helpers --------------------------------------------------------
 
-// Search YouTube and return the first result as { title, url }.
-function searchYouTube(query) {
+function runSearch(query, cookieFile) {
   return new Promise((resolve, reject) => {
-    const proc = spawn('yt-dlp', [
+    const args = [
       `ytsearch1:${query}`,
       '--flat-playlist',
       '--no-warnings',
       '--print', '%(title)s ::: https://www.youtube.com/watch?v=%(id)s',
-    ]);
+    ];
+    if (cookieFile) args.push('--cookies', cookieFile);
 
+    const proc = spawn('yt-dlp', args);
     let out = '';
     let err = '';
     proc.stdout.on('data', (d) => (out += d));
@@ -85,75 +84,128 @@ function searchYouTube(query) {
     proc.on('error', reject);
     proc.on('close', (code) => {
       const line = out.trim().split('\n')[0];
-      if (code !== 0 || !line) {
-        return reject(new Error(err.trim() || `no results (yt-dlp exit ${code})`));
-      }
+      if (code !== 0 || !line) return reject(new Error(err.trim() || `no results (exit ${code})`));
       const sep = line.lastIndexOf(' ::: ');
-      stats.recordSearch();
       resolve({ title: line.slice(0, sep), url: line.slice(sep + 5) });
     });
   });
 }
 
-// Stream a YouTube URL's audio as an Ogg/Opus stream: yt-dlp -> ffmpeg.
-function createTrackStream(url) {
-  const ytdlp = spawn('yt-dlp', [
-    '-f', 'bestaudio',
-    '-o', '-',          // write media to stdout (never to disk)
-    '--no-playlist',
-    '--quiet',
-    '--no-warnings',
-    url,
-  ], { stdio: ['ignore', 'pipe', 'pipe'] });
-
-  const ffmpeg = spawn('ffmpeg', [
-    '-hide_banner', '-loglevel', 'error',
-    '-i', 'pipe:0',
-    '-vn',              // drop any video stream
-    '-c:a', 'libopus',
-    '-b:a', '128k',
-    '-f', 'ogg',
-    'pipe:1',
-  ], { stdio: ['pipe', 'pipe', 'pipe'] });
-
-  ytdlp.stdout.pipe(ffmpeg.stdin);
-  // A consumer that stops early (skip/stop) closes the pipe; swallow EPIPE.
-  ytdlp.stdout.on('error', () => {});
-  ffmpeg.stdin.on('error', () => {});
-
-  ytdlp.stderr.on('data', (d) => console.error('[yt-dlp]', d.toString().trim()));
-  ffmpeg.stderr.on('data', (d) => console.error('[ffmpeg]', d.toString().trim()));
-  ytdlp.on('close', (c) => { if (c) console.error('[yt-dlp] exited with', c); });
-  ffmpeg.on('close', (c) => { if (c) console.error('[ffmpeg] exited with', c); });
-
-  return ffmpeg.stdout;
+// Search YouTube, rotating cookies and retiring any that get bot-walled.
+async function searchYouTube(query) {
+  let lastErr;
+  for (let i = 0; i < Math.max(1, cookies.count()); i++) {
+    const cookieFile = cookies.next();
+    try {
+      const res = await runSearch(query, cookieFile);
+      cookies.reportSuccess(cookieFile);
+      stats.recordSearch();
+      return res;
+    } catch (e) {
+      lastErr = e;
+      if (cookieFile && isBotWall(e.message)) { cookies.reportFailure(cookieFile); continue; }
+      break; // no cookie, or a non-wall error (e.g. genuinely no results)
+    }
+  }
+  throw lastErr || new Error('search failed');
 }
 
-// Play the next queued track. `announce` controls the channel "Now playing"
-// embed — the /play handler suppresses it (it replies to the interaction
-// instead), while auto-advance between tracks announces.
-function playNext(guildId, announce = true) {
+// Start streaming a URL with one cookie. Resolves with an Ogg/Opus stream ONLY
+// once audio actually starts flowing (so a bot-walled cookie rejects before the
+// player ever sees silence). Rejects with the yt-dlp error otherwise.
+function tryStream(url, cookieFile) {
+  return new Promise((resolve, reject) => {
+    const ytArgs = ['-f', 'bestaudio', '-o', '-', '--no-playlist', '--quiet', '--no-warnings'];
+    if (cookieFile) ytArgs.push('--cookies', cookieFile);
+    ytArgs.push(url);
+
+    const ytdlp = spawn('yt-dlp', ytArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const ffmpeg = spawn('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error',
+      '-i', 'pipe:0', '-vn', '-c:a', 'libopus', '-b:a', '128k', '-f', 'ogg', 'pipe:1',
+    ], { stdio: ['pipe', 'pipe', 'pipe'] });
+
+    ytdlp.stdout.pipe(ffmpeg.stdin);
+    ytdlp.stdout.on('error', () => {});
+    ffmpeg.stdin.on('error', () => {});
+
+    let settled = false;
+    let ytErr = '';
+    ytdlp.stderr.on('data', (d) => (ytErr += d.toString()));
+    ffmpeg.stderr.on('data', (d) => { const s = d.toString().trim(); if (s) console.error('[ffmpeg]', s); });
+
+    const kill = () => { try { ytdlp.kill('SIGKILL'); } catch {} try { ffmpeg.kill('SIGKILL'); } catch {} };
+    const fail = (msg) => { if (settled) return; settled = true; clearTimeout(timer); kill(); reject(new Error(msg)); };
+
+    // Success = ffmpeg produced its first bytes (read in paused mode so nothing
+    // is dropped, then unshifted back for the audio resource to consume).
+    const onReadable = () => {
+      if (settled) return;
+      const chunk = ffmpeg.stdout.read();
+      if (!chunk) return;
+      settled = true;
+      clearTimeout(timer);
+      ffmpeg.stdout.removeListener('readable', onReadable);
+      ffmpeg.stdout.unshift(chunk);
+      resolve(ffmpeg.stdout);
+    };
+    ffmpeg.stdout.on('readable', onReadable);
+
+    ytdlp.on('close', (code) => { if (!settled && code !== 0) fail(ytErr.trim() || `yt-dlp exit ${code}`); });
+    ffmpeg.on('close', () => fail('no audio produced'));
+    ytdlp.on('error', (e) => fail(`yt-dlp: ${e.message}`));
+    ffmpeg.on('error', (e) => fail(`ffmpeg: ${e.message}`));
+    const timer = setTimeout(() => fail('stream start timeout'), 25_000);
+  });
+}
+
+// Returns a playable Ogg/Opus stream, rotating cookies on bot-walls. null = all failed.
+async function createTrackStream(url) {
+  let lastErr;
+  for (let i = 0; i < Math.max(1, cookies.count()); i++) {
+    const cookieFile = cookies.next();
+    try {
+      const stream = await tryStream(url, cookieFile);
+      cookies.reportSuccess(cookieFile);
+      return stream;
+    } catch (e) {
+      lastErr = e;
+      const tag = cookieFile ? path.basename(cookieFile) : 'no-cookie';
+      console.error('[stream]', tag, '-', e.message.split('\n')[0]);
+      if (cookieFile && isBotWall(e.message)) { cookies.reportFailure(cookieFile); continue; }
+      break; // no cookie, or a non-wall error specific to this video
+    }
+  }
+  if (lastErr) console.error('[stream] giving up:', lastErr.message.split('\n')[0]);
+  return null;
+}
+
+// Play the next queued track. `announce` posts a channel embed (auto-advance);
+// the /play handler suppresses it and replies to the interaction instead.
+async function playNext(guildId, announce = true) {
   const q = getQueue(guildId);
   const next = q.tracks.shift();
   if (!next) {
     q.playing = false;
-    return;
+    q.current = null;
+    return false;
   }
 
   q.playing = true;
   q.current = next;
 
-  const resource = createAudioResource(createTrackStream(next.url), {
-    inputType: StreamType.OggOpus,
-  });
-  q.player.play(resource);
+  const stream = await createTrackStream(next.url);
+  if (!stream) {
+    if (announce && q.textChannel) q.textChannel.send({ embeds: [failEmbed(next)] }).catch(() => {});
+    return playNext(guildId, announce); // skip the dead track, try the next
+  }
+
+  q.player.play(createAudioResource(stream, { inputType: StreamType.OggOpus }));
 
   const guild = q.textChannel?.guild;
   if (guild) stats.recordPlay(guild.id, guild.name);
-
-  if (announce && q.textChannel) {
-    q.textChannel.send({ embeds: [trackEmbed(next, '🎶 Now playing')] }).catch(() => {});
-  }
+  if (announce && q.textChannel) q.textChannel.send({ embeds: [trackEmbed(next, '🎶 Now playing')] }).catch(() => {});
+  return true;
 }
 
 // --- Embeds -----------------------------------------------------------------
@@ -175,7 +227,16 @@ function trackEmbed(track, author) {
   return e;
 }
 
-// --- Slash command definitions ---------------------------------------------
+function failEmbed(track) {
+  return new EmbedBuilder()
+    .setColor(0xef4444)
+    .setAuthor({ name: '⚠️ Skipped' })
+    .setTitle((track.title || 'Unknown').slice(0, 256))
+    .setDescription('YouTube blocked this request (no working cookies available right now).')
+    .setFooter({ text: 'audiomonkey' });
+}
+
+// --- Slash commands ---------------------------------------------------------
 
 const PUBLIC_COMMANDS = [
   {
@@ -196,6 +257,7 @@ const STATS_COMMAND = { name: 'stats', description: 'Show usage stats (owner onl
 
 client.once(Events.ClientReady, async (c) => {
   console.log(`✅ Logged in as ${c.user.tag}`);
+  console.log(`Cookie pool: ${cookies.count()} file(s).`);
   try {
     await c.application.commands.set(PUBLIC_COMMANDS);
     console.log(`Registered ${PUBLIC_COMMANDS.length} global commands.`);
@@ -211,8 +273,6 @@ client.once(Events.ClientReady, async (c) => {
   }
 });
 
-// --- Interaction handling ---------------------------------------------------
-
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (!interaction.guild) {
@@ -226,7 +286,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (!STATS_GUILD_ID || interaction.guildId !== STATS_GUILD_ID) {
       return interaction.reply({ content: "That command isn't available here.", flags: MessageFlags.Ephemeral });
     }
-    return interaction.reply({ content: stats.summary(client.guilds.cache.size), flags: MessageFlags.Ephemeral });
+    const c = cookies.status();
+    const text = `${stats.summary(client.guilds.cache.size)}\n• Cookies: **${c.available}/${c.total}** available`;
+    return interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
   }
 
   if (cmd === 'play') {
@@ -236,7 +298,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.reply({ content: '🔇 Join a voice channel first.', flags: MessageFlags.Ephemeral });
     }
 
-    await interaction.deferReply(); // search + connect can take >3s
+    await interaction.deferReply();
 
     let track;
     try {
@@ -275,7 +337,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (q.playing) {
       return interaction.editReply({ embeds: [trackEmbed(track, '➕ Added to queue')] });
     }
-    playNext(interaction.guild.id, false);
+    const ok = await playNext(interaction.guild.id, false);
+    if (!ok) {
+      const c = cookies.status();
+      const why = c.total
+        ? `all ${c.total} YouTube cookie${c.total === 1 ? '' : 's'} are cooling down`
+        : 'the server has no YouTube cookies configured';
+      return interaction.editReply(`❌ YouTube blocked this request (${why}). Try again shortly.`);
+    }
     return interaction.editReply({ embeds: [trackEmbed(track, '🎶 Now playing')] });
   }
 
@@ -284,7 +353,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (!q || !q.playing) {
       return interaction.reply({ content: 'Nothing is playing.', flags: MessageFlags.Ephemeral });
     }
-    q.player.stop(); // fires Idle -> playNext
+    q.player.stop();
     return interaction.reply('⏭️ Skipped.');
   }
 

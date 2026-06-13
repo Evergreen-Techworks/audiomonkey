@@ -2,3 +2,4 @@ node_modules/
 .env
 *.mp3
 stats.json
+cookies/*.txt
