@@ -1,5 +1,6 @@
 # audiomonkey — Free Open-Source Discord Music Bot 🎵
 
+[![Discord](https://img.shields.io/badge/discord-join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/WC4FGuZFxY)
 [![License](https://img.shields.io/badge/license-MIT-14b8a6)](LICENSE)
 [![Node](https://img.shields.io/badge/node-18%2B-0d9488?logo=node.js&logoColor=white)](https://nodejs.org)
 [![discord.js](https://img.shields.io/badge/discord.js-v14-5865F2?logo=discord&logoColor=white)](https://discord.js.org)
@@ -10,6 +11,8 @@
 > **TL;DR:** A simple, self-hostable **YouTube → Discord music bot** built with `discord.js` + `yt-dlp` + `ffmpeg`. Invite the hosted bot in one click, or run your own in minutes. 100% open source under MIT — every line on GitHub.
 
 🔎 Want a **free Rythm / Groovy alternative** you actually control? This is it — fork it, host it, keep it running forever. Nobody can shut down a bot you run yourself.
+
+💬 **Questions, bugs, or updates?** Join the EGTW Discord: **[discord.gg/WC4FGuZFxY](https://discord.gg/WC4FGuZFxY)**
 
 ---
 
@@ -172,7 +175,7 @@ Pennies. A single `t3.nano` handles a small server's listening just fine.
 
 ## 🤝 Contributing
 
-PRs welcome — open an issue or ship an improvement. It's a small codebase; jump in.
+PRs welcome — open an issue, ship an improvement, or hop into the [EGTW Discord](https://discord.gg/WC4FGuZFxY) to chat. It's a small codebase; jump in.
 
 ---
 
