@@ -1,0 +1,55 @@
+name: Deploy to EC2
+
+# Auto-deploy to the t3.nano on every push to main.
+# Uses GitHub OIDC -> AWS IAM role -> SSM Run Command (no SSH, no open ports,
+# no long-lived AWS keys stored in GitHub).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Only one deploy at a time; newer pushes supersede in-flight ones.
+concurrency:
+  group: deploy-main
+  cancel-in-progress: true
+
+permissions:
+  id-token: write   # required to request the OIDC token
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::310201233858:role/audiomonkey-deploy
+          aws-region: us-east-1
+
+      - name: Deploy via SSM
+        env:
+          INSTANCE_ID: i-0f71ee317a0c682af
+        run: |
+          set -euo pipefail
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "Deploy ${GITHUB_SHA::7}" \
+            --parameters commands='["set -eux","cd /home/ubuntu/audiomonkey","sudo -u ubuntu git fetch --all -q","sudo -u ubuntu git reset --hard origin/main","sudo -u ubuntu npm ci --omit=dev","systemctl restart audiomonkey || true","sudo -u ubuntu git rev-parse --short HEAD"]' \
+            --query 'Command.CommandId' --output text)
+          echo "SSM CommandId: $CMD_ID"
+
+          aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" || true
+
+          STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --query 'Status' --output text)
+          echo "::group::Remote stdout"
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --query 'StandardOutputContent' --output text
+          echo "::endgroup::"
+          echo "::group::Remote stderr"
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --query 'StandardErrorContent' --output text
+          echo "::endgroup::"
+
+          echo "Final status: $STATUS"
+          test "$STATUS" = "Success"
