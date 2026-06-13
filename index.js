@@ -10,6 +10,9 @@ const {
   ApplicationCommandOptionType,
   MessageFlags,
   EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
 } = require('discord.js');
 const {
   joinVoiceChannel,
@@ -233,7 +236,9 @@ async function playNext(guildId, announce = true) {
 
   const guild = q.textChannel?.guild;
   if (guild) stats.recordPlay(guild.id, guild.name);
-  if (announce && q.textChannel) q.textChannel.send({ embeds: [trackEmbed(next, '🎶 Now playing')] }).catch(() => {});
+  if (announce && q.textChannel) {
+    q.textChannel.send({ embeds: [trackEmbed(next, '🎶 Now playing')], components: [controls()] }).catch(() => {});
+  }
   return true;
 }
 
@@ -263,6 +268,69 @@ function failEmbed(track) {
     .setTitle((track.title || 'Unknown').slice(0, 256))
     .setDescription('YouTube blocked this request (no working cookies/proxies available right now).')
     .setFooter({ text: 'audiomonkey' });
+}
+
+// Button row shown under "Now playing" embeds.
+function controls() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('am_skip').setEmoji('⏭️').setLabel('Skip').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('am_stop').setEmoji('⏹️').setLabel('Stop').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId('am_queue').setEmoji('🎵').setLabel('Queue').setStyle(ButtonStyle.Secondary),
+  );
+}
+
+function queueEmbed(guildId) {
+  const q = queues.get(guildId);
+  if (!q || (!q.current && q.tracks.length === 0)) return null;
+  const e = new EmbedBuilder().setColor(BRAND).setTitle('🎵 Queue').setFooter({ text: 'audiomonkey' });
+  if (q.current) e.setDescription(`**Now playing**\n${q.current.title}`);
+  if (q.tracks.length) {
+    e.addFields({
+      name: 'Up next',
+      value: q.tracks.map((t, i) => `\`${i + 1}.\` ${t.title}`).join('\n').slice(0, 1024),
+    });
+  }
+  return e;
+}
+
+// --- Shared actions (used by both slash commands and buttons) ---------------
+
+function actionSkip(guildId) {
+  const q = queues.get(guildId);
+  if (!q || !q.playing) return { ok: false, msg: 'Nothing is playing.' };
+  q.player.stop(); // fires Idle -> playNext
+  return { ok: true, msg: '⏭️ Skipped.' };
+}
+
+function actionStop(guildId) {
+  const q = queues.get(guildId);
+  if (q) {
+    q.tracks = [];
+    q.playing = false;
+    q.player.stop();
+  }
+  getVoiceConnection(guildId)?.destroy();
+  return { ok: true, msg: '⏹️ Stopped and left the channel.' };
+}
+
+async function handleButton(interaction) {
+  if (!interaction.guild) return;
+  const gid = interaction.guild.id;
+  const e = MessageFlags.Ephemeral;
+
+  if (interaction.customId === 'am_skip') {
+    stats.recordCommand('skip');
+    return interaction.reply({ content: actionSkip(gid).msg, flags: e });
+  }
+  if (interaction.customId === 'am_stop') {
+    stats.recordCommand('stop');
+    return interaction.reply({ content: actionStop(gid).msg, flags: e });
+  }
+  if (interaction.customId === 'am_queue') {
+    stats.recordCommand('queue');
+    const embed = queueEmbed(gid);
+    return interaction.reply(embed ? { embeds: [embed], flags: e } : { content: 'Queue is empty.', flags: e });
+  }
 }
 
 // --- Slash commands ---------------------------------------------------------
@@ -301,6 +369,7 @@ client.once(Events.ClientReady, async (c) => {
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
+  if (interaction.isButton()) return handleButton(interaction);
   if (!interaction.isChatInputCommand()) return;
   if (!interaction.guild) {
     return interaction.reply({ content: 'Use me in a server.', flags: MessageFlags.Ephemeral });
@@ -375,43 +444,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (!ok) {
       return interaction.editReply('❌ YouTube blocked this request (all cookies/proxies are cooling down). Try again shortly.');
     }
-    return interaction.editReply({ embeds: [trackEmbed(track, '🎶 Now playing')] });
+    return interaction.editReply({ embeds: [trackEmbed(track, '🎶 Now playing')], components: [controls()] });
   }
 
   if (cmd === 'skip') {
-    const q = queues.get(interaction.guild.id);
-    if (!q || !q.playing) {
-      return interaction.reply({ content: 'Nothing is playing.', flags: MessageFlags.Ephemeral });
-    }
-    q.player.stop();
-    return interaction.reply('⏭️ Skipped.');
+    const r = actionSkip(interaction.guild.id);
+    return interaction.reply(r.ok ? r.msg : { content: r.msg, flags: MessageFlags.Ephemeral });
   }
 
   if (cmd === 'stop') {
-    const q = queues.get(interaction.guild.id);
-    if (q) {
-      q.tracks = [];
-      q.playing = false;
-      q.player.stop();
-    }
-    getVoiceConnection(interaction.guild.id)?.destroy();
-    return interaction.reply('⏹️ Stopped and left the channel.');
+    return interaction.reply(actionStop(interaction.guild.id).msg);
   }
 
   if (cmd === 'queue') {
-    const q = queues.get(interaction.guild.id);
-    if (!q || (!q.current && q.tracks.length === 0)) {
-      return interaction.reply({ content: 'Queue is empty.', flags: MessageFlags.Ephemeral });
-    }
-    const e = new EmbedBuilder().setColor(BRAND).setTitle('🎵 Queue').setFooter({ text: 'audiomonkey' });
-    if (q.current) e.setDescription(`**Now playing**\n${q.current.title}`);
-    if (q.tracks.length) {
-      e.addFields({
-        name: 'Up next',
-        value: q.tracks.map((t, i) => `\`${i + 1}.\` ${t.title}`).join('\n').slice(0, 1024),
-      });
-    }
-    return interaction.reply({ embeds: [e] });
+    const e = queueEmbed(interaction.guild.id);
+    return e
+      ? interaction.reply({ embeds: [e] })
+      : interaction.reply({ content: 'Queue is empty.', flags: MessageFlags.Ephemeral });
   }
 });
 

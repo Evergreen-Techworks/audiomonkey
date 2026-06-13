@@ -58,6 +58,7 @@ Then join a voice channel and type:
 ## ✨ Features
 
 - **Search-to-play** — no URLs needed; it finds the top YouTube match for you
+- **Now-playing controls** — Skip / Stop / Queue buttons right under the embed
 - **Direct audio streaming** — `yt-dlp → ffmpeg → Ogg/Opus`, nothing written to disk
 - **Per-server music queue** — `/play` again while a track is going and it lines up
 - **Private usage stats** — a gated `/stats` command, registered only in one server you choose
