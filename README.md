@@ -5,15 +5,17 @@
 [![discord.js](https://img.shields.io/badge/discord.js-v14-5865F2?logo=discord&logoColor=white)](https://discord.js.org)
 [![Stars](https://img.shields.io/github/stars/Evergreen-Techworks/audiomonkey?style=social)](https://github.com/Evergreen-Techworks/audiomonkey/stargazers)
 
-**audiomonkey** is a dead-simple, free, open-source **Discord music bot**. Type a song name, it searches YouTube, grabs the top result, and streams it straight into your voice channel. No queue gymnastics, no paywall, no premium tier — every line on GitHub.
+**audiomonkey** is a **free, open-source Discord music bot** that plays music from **YouTube** in your voice channel. Type a song name — it searches YouTube, grabs the top result, and streams it straight into the call. No premium tier, no paywall, no vote-locking, no "this command is supporters-only." Just `!play <anything>` and it plays.
 
-> **TL;DR:** `!play <anything>` → it finds the song on YouTube and plays it. Streams audio directly via `yt-dlp` + `ffmpeg` (no files saved to disk). Self-host it on a tiny box, or invite the hosted bot in one click.
+> **TL;DR:** A simple, self-hostable **YouTube → Discord music bot** built with `discord.js` + `yt-dlp` + `ffmpeg`. Invite the hosted bot in one click, or run your own in minutes. 100% open source under MIT — every line on GitHub.
+
+🔎 Want a **free Rythm / Groovy alternative** you actually control? This is it — fork it, host it, keep it running forever. Nobody can shut down a bot you run yourself.
 
 ---
 
 ## ➕ Add it to your server
 
-👉 **[Invite audiomonkey](https://discord.com/oauth2/authorize?client_id=YOUR_APPLICATION_ID&permissions=36785152&scope=bot)**
+👉 **[Invite audiomonkey to your Discord server](https://discord.com/oauth2/authorize?client_id=YOUR_APPLICATION_ID&permissions=36785152&scope=bot)**
 
 Then join a voice channel and type:
 
@@ -21,31 +23,41 @@ Then join a voice channel and type:
 !play never gonna give you up
 ```
 
-> Replace `YOUR_APPLICATION_ID` with the bot's Application ID (Discord Dev Portal → your app → General Information). Self-hosting? See [Self-host](#-self-host) below.
+> Replace `YOUR_APPLICATION_ID` with the bot's Application ID (Discord Dev Portal → your app → General Information). Prefer to run your own copy? See [Self-host](#-self-host-your-own-discord-music-bot) below.
+
+---
+
+## ⭐ Why audiomonkey?
+
+- **Actually free** — every command, forever. No premium gate, no paywalled `!skip`, no vote-to-use.
+- **Open source (MIT)** — read every line, fork it, self-host it, even build your own bot on top.
+- **Plays from YouTube** — search by song name or paste a YouTube URL.
+- **Self-hostable** — runs happily on a ~$4/mo AWS `t3.nano`; you own it, so it can't be taken down.
+- **No native build pain** — pure-JS Opus passthrough, so `npm install` just works on any machine.
 
 ---
 
 ## 🎚️ Commands
 
-| Command            | What it does                                   |
-| ------------------ | ---------------------------------------------- |
-| `!play <words>`    | Search YouTube and play the first result       |
-| `!play <url>`      | Play a specific YouTube URL                    |
-| `!skip`            | Skip the current track                         |
-| `!stop` / `!leave` | Clear the queue and leave the channel          |
-| `!queue`           | Show what's playing and what's queued          |
-| `!stats`           | Usage stats — **only** in the owner's server (see below) |
+| Command            | What it does                                          |
+| ------------------ | ----------------------------------------------------- |
+| `!play <words>`    | Search YouTube and play the first result              |
+| `!play <url>`      | Play a specific YouTube URL                           |
+| `!skip`            | Skip the current track                                |
+| `!stop` / `!leave` | Clear the queue and leave the channel                 |
+| `!queue`           | Show what's playing and what's queued                 |
+| `!stats`           | Usage stats — **only** in the owner's server (private) |
 
 ---
 
 ## ✨ Features
 
 - **Search-to-play** — no URLs needed; it finds the top YouTube match for you
-- **Direct streaming** — `yt-dlp → ffmpeg → Ogg/Opus`, nothing written to disk
-- **Per-server queue** — `!play` again while a track is going and it lines up
+- **Direct audio streaming** — `yt-dlp → ffmpeg → Ogg/Opus`, nothing written to disk
+- **Per-server music queue** — `!play` again while a track is going and it lines up
 - **Private usage stats** — a gated `!stats` command, locked to one server you choose
-- **Tiny footprint** — runs happily on a $4/mo AWS `t3.nano`
-- **No native build step** — pure-JS Opus passthrough, so `npm install` just works
+- **Tiny footprint** — sips RAM; runs on the smallest cloud box you can rent
+- **Zero paywalls** — it's a hobby bot, not a freemium funnel
 
 ---
 
@@ -62,7 +74,7 @@ deploy/
 
 ---
 
-## 🚀 Self-host
+## 🚀 Self-host your own Discord music bot
 
 ### Requirements
 - **Node.js** 18+
@@ -124,12 +136,31 @@ STATS_GUILD_ID=123456789012345678   # your "home" server's ID
 
 ---
 
-## ❓ FAQ
+## ❓ FAQ — Discord music bot questions
+
+**Is there a free Discord music bot?**
+Yes. audiomonkey is 100% free and open source — every feature, no premium tier, no paywall, no donation wall on `!play`.
+
+**How do I add a music bot to my Discord server?**
+Click the [invite link](#-add-it-to-your-server) above, pick your server, authorize it, then join a voice channel and type `!play <song name>`. You need *Manage Server* permission to add bots.
+
+**What's the best open-source Discord music bot?**
+"Best" depends on what you want — audiomonkey is built for simplicity: search YouTube, play the top result, done. The whole thing is a couple of small files you can read in five minutes and host yourself.
+
+**Is this a Rythm or Groovy alternative?**
+Yes. After the big public music bots got shut down, the reliable move is to host your own. audiomonkey is a free, self-hostable replacement that plays music from YouTube — and because *you* run it, it can't be taken offline.
+
+**Can I self-host my own Discord music bot?**
+That's the whole point. Clone the repo, drop in your bot token, `npm start`. It runs on anything from a Raspberry Pi to a $4/mo cloud VM. See [Self-host](#-self-host-your-own-discord-music-bot).
+
+**Does it require a premium subscription, voting, or donations?**
+No. There's nothing to buy and nothing to vote for. It's open source under MIT.
+
+**How does it play YouTube audio in Discord?**
+It uses `yt-dlp` to find and pull the audio and `ffmpeg` to transcode it to Opus, then streams it into the voice channel via `@discordjs/voice`. No files are saved to disk.
 
 **Does it save MP3 files?**
-No — it streams audio directly, which is faster and uses no disk. (If you want
-real `.mp3` files, swap `createTrackStream` for a `yt-dlp -x --audio-format mp3`
-download and feed the file to `createAudioResource`.)
+No — it streams audio directly, which is faster and uses no disk. (If you want real `.mp3` files, swap `createTrackStream` for a `yt-dlp -x --audio-format mp3` download and feed the file to `createAudioResource`.)
 
 **Playback suddenly stopped working.**
 YouTube probably changed something. Update yt-dlp: `yt-dlp -U`.
@@ -141,18 +172,18 @@ Pennies. A single `t3.nano` handles a small server's listening just fine.
 
 ## 🤝 Contributing
 
-PRs welcome — open an issue or ship an improvement.
+PRs welcome — open an issue or ship an improvement. It's a small codebase; jump in.
 
 ---
 
 ## 📄 License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). Fork it, host it, build on it.
 
 ---
 
 <details>
 <summary><strong>Keywords (for search indexing)</strong></summary>
 
-discord music bot, discord bot, open source discord music bot, free discord music bot, youtube discord bot, play youtube in discord, discord.js music bot, yt-dlp discord bot, ffmpeg discord audio, discord voice bot, self-hosted discord bot, nodejs discord music bot
+discord music bot, free discord music bot, open source discord music bot, best free discord music bot, discord music bot github, self hosted discord music bot, self host discord music bot, youtube music bot discord, play youtube in discord, discord bot that plays music, discord.js music bot, nodejs discord music bot, yt-dlp discord bot, ffmpeg discord audio, discord voice bot, discord music bot 2026, rythm alternative, groovy alternative, rythm discord bot alternative, groovy discord bot alternative, free music bot for discord, music bot for discord server, how to add a music bot to discord, how to make a discord music bot, discord music player, mee6 music alternative
 </details>
