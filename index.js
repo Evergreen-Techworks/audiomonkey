@@ -26,6 +26,10 @@ const cookies = require('./cookies');
 
 const BRAND = 0x14b8a6;
 const STATS_GUILD_ID = process.env.STATS_GUILD_ID;
+// Optional proxy (e.g. a residential gateway) used for the bot-walled YouTube
+// *extraction* step. Audio bytes still download over the host's own IP, so the
+// proxy only carries KBs/song. Never logged.
+const PROXY = process.env.PROXY || null;
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
@@ -74,6 +78,7 @@ function runSearch(query, cookieFile) {
       '--no-warnings',
       '--print', '%(title)s ::: https://www.youtube.com/watch?v=%(id)s',
     ];
+    if (PROXY) args.push('--proxy', PROXY);
     if (cookieFile) args.push('--cookies', cookieFile);
 
     const proc = spawn('yt-dlp', args);
@@ -110,35 +115,48 @@ async function searchYouTube(query) {
   throw lastErr || new Error('search failed');
 }
 
-// Start streaming a URL with one cookie. Resolves with an Ogg/Opus stream ONLY
-// once audio actually starts flowing (so a bot-walled cookie rejects before the
-// player ever sees silence). Rejects with the yt-dlp error otherwise.
-function tryStream(url, cookieFile) {
+// --- Streaming pipeline -----------------------------------------------------
+//
+// Cost-optimised for residential proxies (billed per GB): the *extraction* (the
+// small, bot-walled youtube.com step) goes through the proxy, but the actual
+// audio is pulled straight from googlevideo's CDN by ffmpeg over the host's own
+// IP — so the proxy only carries KBs/song, not MBs. If a media URL turns out to
+// be IP-locked to the extraction IP, we fall back to downloading that one song
+// through the proxy (full bandwidth).
+
+// Extraction: resolve the direct googlevideo media URL (small; via proxy).
+function getDirectUrl(url, cookieFile) {
   return new Promise((resolve, reject) => {
-    const ytArgs = ['-f', 'bestaudio', '-o', '-', '--no-playlist', '--quiet', '--no-warnings'];
-    if (cookieFile) ytArgs.push('--cookies', cookieFile);
-    ytArgs.push(url);
+    const args = ['-f', 'bestaudio', '--get-url', '--no-playlist', '--no-warnings'];
+    if (PROXY) args.push('--proxy', PROXY);
+    if (cookieFile) args.push('--cookies', cookieFile);
+    args.push(url);
 
-    const ytdlp = spawn('yt-dlp', ytArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
-    const ffmpeg = spawn('ffmpeg', [
-      '-hide_banner', '-loglevel', 'error',
-      '-i', 'pipe:0', '-vn', '-c:a', 'libopus', '-b:a', '128k', '-f', 'ogg', 'pipe:1',
-    ], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const proc = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    let err = '';
+    proc.stdout.on('data', (d) => (out += d));
+    proc.stderr.on('data', (d) => (err += d));
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      const direct = out.trim().split('\n').filter(Boolean)[0];
+      if (code !== 0 || !direct) return reject(new Error(err.trim() || `extract exit ${code}`));
+      resolve(direct);
+    });
+  });
+}
 
-    ytdlp.stdout.pipe(ffmpeg.stdin);
-    ytdlp.stdout.on('error', () => {});
-    ffmpeg.stdin.on('error', () => {});
-
+// Resolve with ffmpeg.stdout once it produces its first bytes (read in paused
+// mode so nothing is dropped). Rejects if a source process dies first.
+function firstBytes(ffmpeg, procs, getErr) {
+  return new Promise((resolve, reject) => {
     let settled = false;
-    let ytErr = '';
-    ytdlp.stderr.on('data', (d) => (ytErr += d.toString()));
-    ffmpeg.stderr.on('data', (d) => { const s = d.toString().trim(); if (s) console.error('[ffmpeg]', s); });
+    let ffErr = '';
+    ffmpeg.stderr.on('data', (d) => { ffErr += d.toString(); });
 
-    const kill = () => { try { ytdlp.kill('SIGKILL'); } catch {} try { ffmpeg.kill('SIGKILL'); } catch {} };
+    const kill = () => procs.forEach((p) => { try { p.kill('SIGKILL'); } catch {} });
     const fail = (msg) => { if (settled) return; settled = true; clearTimeout(timer); kill(); reject(new Error(msg)); };
 
-    // Success = ffmpeg produced its first bytes (read in paused mode so nothing
-    // is dropped, then unshifted back for the audio resource to consume).
     const onReadable = () => {
       if (settled) return;
       const chunk = ffmpeg.stdout.read();
@@ -151,12 +169,44 @@ function tryStream(url, cookieFile) {
     };
     ffmpeg.stdout.on('readable', onReadable);
 
-    ytdlp.on('close', (code) => { if (!settled && code !== 0) fail(ytErr.trim() || `yt-dlp exit ${code}`); });
-    ffmpeg.on('close', () => fail('no audio produced'));
-    ytdlp.on('error', (e) => fail(`yt-dlp: ${e.message}`));
+    procs.forEach((p) => p.on('close', (code) => {
+      if (!settled && code) fail((getErr && getErr()) || ffErr.trim() || `exit ${code}`);
+    }));
     ffmpeg.on('error', (e) => fail(`ffmpeg: ${e.message}`));
     const timer = setTimeout(() => fail('stream start timeout'), 25_000);
   });
+}
+
+// Cheap path: ffmpeg pulls the media URL directly over the host's IP (no proxy).
+function streamUrlDirect(mediaUrl) {
+  const ffmpeg = spawn('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error',
+    '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+    '-i', mediaUrl, '-vn', '-c:a', 'libopus', '-b:a', '128k', '-f', 'ogg', 'pipe:1',
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  return firstBytes(ffmpeg, [ffmpeg]);
+}
+
+// Fallback path: download through the proxy via yt-dlp (full bandwidth).
+function streamViaProxy(url, cookieFile) {
+  const ytArgs = ['-f', 'bestaudio', '-o', '-', '--no-playlist', '--quiet', '--no-warnings'];
+  if (PROXY) ytArgs.push('--proxy', PROXY);
+  if (cookieFile) ytArgs.push('--cookies', cookieFile);
+  ytArgs.push(url);
+
+  const ytdlp = spawn('yt-dlp', ytArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const ffmpeg = spawn('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error',
+    '-i', 'pipe:0', '-vn', '-c:a', 'libopus', '-b:a', '128k', '-f', 'ogg', 'pipe:1',
+  ], { stdio: ['pipe', 'pipe', 'pipe'] });
+
+  ytdlp.stdout.pipe(ffmpeg.stdin);
+  ytdlp.stdout.on('error', () => {});
+  ffmpeg.stdin.on('error', () => {});
+  let ytErr = '';
+  ytdlp.stderr.on('data', (d) => (ytErr += d.toString()));
+
+  return firstBytes(ffmpeg, [ytdlp, ffmpeg], () => ytErr.trim());
 }
 
 // Returns a playable Ogg/Opus stream, rotating cookies on bot-walls. null = all failed.
@@ -164,17 +214,42 @@ async function createTrackStream(url) {
   let lastErr;
   for (let i = 0; i < Math.max(1, cookies.count()); i++) {
     const cookieFile = cookies.next();
+    const tag = cookieFile ? path.basename(cookieFile) : 'no-cookie';
+
+    let directUrl;
     try {
-      const stream = await tryStream(url, cookieFile);
-      cookies.reportSuccess(cookieFile);
-      return stream;
+      directUrl = await getDirectUrl(url, cookieFile); // small, via proxy; clears the wall
     } catch (e) {
       lastErr = e;
-      const tag = cookieFile ? path.basename(cookieFile) : 'no-cookie';
-      console.error('[stream]', tag, '-', e.message.split('\n')[0]);
+      console.error('[extract]', tag, '-', e.message.split('\n')[0]);
       if (cookieFile && isBotWall(e.message)) { cookies.reportFailure(cookieFile); continue; }
-      break; // no cookie, or a non-wall error specific to this video
+      break; // no cookie, or a non-wall error (e.g. unavailable video)
     }
+
+    // Cheap path: pull the audio straight from the CDN over our own IP.
+    try {
+      const stream = await streamUrlDirect(directUrl);
+      cookies.reportSuccess(cookieFile);
+      console.log('[stream] direct-from-host (cheap)');
+      return stream;
+    } catch (e) {
+      console.warn('[stream] direct download failed (likely IP-locked):', e.message.split('\n')[0]);
+    }
+
+    // Fallback: download through the proxy (full bandwidth) — only when needed.
+    if (PROXY) {
+      try {
+        const stream = await streamViaProxy(url, cookieFile);
+        cookies.reportSuccess(cookieFile);
+        console.log('[stream] via-proxy download (full bandwidth)');
+        return stream;
+      } catch (e) {
+        lastErr = e;
+        console.error('[stream]', tag, '- proxy dl:', e.message.split('\n')[0]);
+        if (cookieFile && isBotWall(e.message)) { cookies.reportFailure(cookieFile); continue; }
+      }
+    }
+    break;
   }
   if (lastErr) console.error('[stream] giving up:', lastErr.message.split('\n')[0]);
   return null;
@@ -257,7 +332,7 @@ const STATS_COMMAND = { name: 'stats', description: 'Show usage stats (owner onl
 
 client.once(Events.ClientReady, async (c) => {
   console.log(`✅ Logged in as ${c.user.tag}`);
-  console.log(`Cookie pool: ${cookies.count()} file(s).`);
+  console.log(`Cookie pool: ${cookies.count()} file(s). Proxy: ${PROXY ? 'configured' : 'none'}.`);
   try {
     await c.application.commands.set(PUBLIC_COMMANDS);
     console.log(`Registered ${PUBLIC_COMMANDS.length} global commands.`);
@@ -287,7 +362,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.reply({ content: "That command isn't available here.", flags: MessageFlags.Ephemeral });
     }
     const c = cookies.status();
-    const text = `${stats.summary(client.guilds.cache.size)}\n• Cookies: **${c.available}/${c.total}** available`;
+    const text = `${stats.summary(client.guilds.cache.size)}\n• Cookies: **${c.available}/${c.total}** available\n• Proxy: **${PROXY ? 'on' : 'off'}**`;
     return interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
   }
 
