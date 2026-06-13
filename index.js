@@ -1,7 +1,13 @@
 'use strict';
 
 const { spawn } = require('node:child_process');
-const { Client, GatewayIntentBits, Events } = require('discord.js');
+const {
+  Client,
+  GatewayIntentBits,
+  Events,
+  ApplicationCommandOptionType,
+  MessageFlags,
+} = require('discord.js');
 const {
   joinVoiceChannel,
   createAudioPlayer,
@@ -14,18 +20,13 @@ const {
 } = require('@discordjs/voice');
 const stats = require('./stats');
 
-const PREFIX = process.env.PREFIX || '!';
-// Server (guild) ID where the private `!stats` command is allowed. Leave unset
-// to disable the command entirely.
+// Server (guild) ID where the private /stats command is registered + allowed.
+// Leave unset to disable it entirely.
 const STATS_GUILD_ID = process.env.STATS_GUILD_ID;
 
+// Slash commands need no privileged intents — just guild + voice state.
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent, // privileged — enable in the Dev Portal (see README)
-  ],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
 
 // --- Per-guild music state --------------------------------------------------
@@ -115,7 +116,10 @@ function createTrackStream(url) {
   return ffmpeg.stdout;
 }
 
-function playNext(guildId) {
+// Play the next queued track. `announce` controls the channel "Now playing"
+// message — the /play handler suppresses it (it replies to the interaction
+// instead), while auto-advance between tracks announces.
+function playNext(guildId, announce = true) {
   const q = getQueue(guildId);
   const next = q.tracks.shift();
   if (!next) {
@@ -134,108 +138,148 @@ function playNext(guildId) {
   const guild = q.textChannel?.guild;
   if (guild) stats.recordPlay(guild.id, guild.name);
 
-  if (q.textChannel) {
+  if (announce && q.textChannel) {
     q.textChannel.send(`🎶 Now playing: **${next.title}**`).catch(() => {});
   }
 }
 
-// --- Commands ---------------------------------------------------------------
+// --- Slash command definitions ---------------------------------------------
 
-client.once(Events.ClientReady, (c) => {
+const PUBLIC_COMMANDS = [
+  {
+    name: 'play',
+    description: 'Search YouTube and play a song in your voice channel',
+    options: [{
+      name: 'query',
+      description: 'Song name or YouTube URL',
+      type: ApplicationCommandOptionType.String,
+      required: true,
+    }],
+  },
+  { name: 'skip', description: 'Skip the current track' },
+  { name: 'stop', description: 'Stop playback and leave the voice channel' },
+  { name: 'queue', description: 'Show what is playing and what is queued' },
+];
+const STATS_COMMAND = { name: 'stats', description: 'Show usage stats (owner only)' };
+
+client.once(Events.ClientReady, async (c) => {
   console.log(`✅ Logged in as ${c.user.tag}`);
+  try {
+    // Global commands (every server; can take a little while to propagate).
+    await c.application.commands.set(PUBLIC_COMMANDS);
+    console.log(`Registered ${PUBLIC_COMMANDS.length} global commands.`);
+
+    // Owner server: register instantly + add the private /stats command.
+    if (STATS_GUILD_ID) {
+      const g = await c.guilds.fetch(STATS_GUILD_ID).catch(() => null);
+      if (g) {
+        await g.commands.set([...PUBLIC_COMMANDS, STATS_COMMAND]);
+        console.log(`Registered guild commands in "${g.name}" (incl. /stats).`);
+      }
+    }
+  } catch (e) {
+    console.error('Command registration failed:', e.message);
+  }
 });
 
-client.on(Events.MessageCreate, async (message) => {
-  if (message.author.bot || !message.guild) return;
-  if (!message.content.startsWith(PREFIX)) return;
+// --- Interaction handling ---------------------------------------------------
 
-  const [raw, ...rest] = message.content.slice(PREFIX.length).trim().split(/\s+/);
-  const command = raw.toLowerCase();
-  const args = rest.join(' ');
-
-  const KNOWN = ['play', 'p', 'skip', 's', 'stop', 'leave', 'queue', 'q', 'stats'];
-  if (KNOWN.includes(command)) stats.recordCommand(command);
-
-  // Private stats command — only works in the configured server, and silently
-  // ignored everywhere else so regular users never see it.
-  if (command === 'stats') {
-    if (!STATS_GUILD_ID || message.guild.id !== STATS_GUILD_ID) return;
-    return message.reply(stats.summary(client.guilds.cache.size));
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  if (!interaction.guild) {
+    return interaction.reply({ content: 'Use me in a server.', flags: MessageFlags.Ephemeral });
   }
 
-  if (command === 'play' || command === 'p') {
-    if (!args) return message.reply('Usage: `!play <search terms or YouTube URL>`');
+  const cmd = interaction.commandName;
+  stats.recordCommand(cmd);
 
-    const voiceChannel = message.member?.voice?.channel;
-    if (!voiceChannel) return message.reply('🔇 Join a voice channel first.');
+  if (cmd === 'stats') {
+    if (!STATS_GUILD_ID || interaction.guildId !== STATS_GUILD_ID) {
+      return interaction.reply({ content: "That command isn't available here.", flags: MessageFlags.Ephemeral });
+    }
+    return interaction.reply({ content: stats.summary(client.guilds.cache.size), flags: MessageFlags.Ephemeral });
+  }
 
-    message.channel.sendTyping().catch(() => {});
+  if (cmd === 'play') {
+    const query = interaction.options.getString('query', true);
+    const voiceChannel = interaction.member?.voice?.channel;
+    if (!voiceChannel) {
+      return interaction.reply({ content: '🔇 Join a voice channel first.', flags: MessageFlags.Ephemeral });
+    }
+
+    await interaction.deferReply(); // search + connect can take >3s
 
     let track;
     try {
-      track = /^https?:\/\//.test(args)
-        ? { title: args, url: args }
-        : await searchYouTube(args);
+      track = /^https?:\/\//.test(query)
+        ? { title: query, url: query }
+        : await searchYouTube(query);
     } catch (e) {
       console.error('[search]', e.message);
-      return message.reply('❌ Could not find anything for that.');
+      return interaction.editReply('❌ Could not find anything for that.');
     }
 
-    const q = getQueue(message.guild.id);
-    q.textChannel = message.channel;
+    const q = getQueue(interaction.guild.id);
+    q.textChannel = interaction.channel;
     q.tracks.push(track);
 
-    let connection = getVoiceConnection(message.guild.id);
+    let connection = getVoiceConnection(interaction.guild.id);
     if (!connection) {
       connection = joinVoiceChannel({
         channelId: voiceChannel.id,
-        guildId: message.guild.id,
-        adapterCreator: message.guild.voiceAdapterCreator,
+        guildId: interaction.guild.id,
+        adapterCreator: interaction.guild.voiceAdapterCreator,
       });
       connection.subscribe(q.player);
       try {
         await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
       } catch {
         connection.destroy();
-        queues.delete(message.guild.id);
-        return message.reply('❌ Failed to join the voice channel.');
+        queues.delete(interaction.guild.id);
+        return interaction.editReply('❌ Failed to join the voice channel.');
       }
     }
 
     if (q.playing) {
-      return message.reply(`➕ Queued: **${track.title}**`);
+      return interaction.editReply(`➕ Queued: **${track.title}**`);
     }
-    playNext(message.guild.id);
-    return;
+    playNext(interaction.guild.id, false);
+    return interaction.editReply(`🎶 Now playing: **${track.title}**`);
   }
 
-  if (command === 'skip' || command === 's') {
-    const q = queues.get(message.guild.id);
-    if (!q || !q.playing) return message.reply('Nothing is playing.');
+  if (cmd === 'skip') {
+    const q = queues.get(interaction.guild.id);
+    if (!q || !q.playing) {
+      return interaction.reply({ content: 'Nothing is playing.', flags: MessageFlags.Ephemeral });
+    }
     q.player.stop(); // fires Idle -> playNext
-    return message.reply('⏭️ Skipped.');
+    return interaction.reply('⏭️ Skipped.');
   }
 
-  if (command === 'stop' || command === 'leave') {
-    const q = queues.get(message.guild.id);
+  if (cmd === 'stop') {
+    const q = queues.get(interaction.guild.id);
     if (q) {
       q.tracks = [];
       q.playing = false;
       q.player.stop();
     }
-    getVoiceConnection(message.guild.id)?.destroy();
-    return message.reply('⏹️ Stopped and left the channel.');
+    getVoiceConnection(interaction.guild.id)?.destroy();
+    return interaction.reply('⏹️ Stopped and left the channel.');
   }
 
-  if (command === 'queue' || command === 'q') {
-    const q = queues.get(message.guild.id);
-    if (!q || (!q.current && q.tracks.length === 0)) return message.reply('Queue is empty.');
+  if (cmd === 'queue') {
+    const q = queues.get(interaction.guild.id);
+    if (!q || (!q.current && q.tracks.length === 0)) {
+      return interaction.reply({ content: 'Queue is empty.', flags: MessageFlags.Ephemeral });
+    }
     const lines = [];
     if (q.current) lines.push(`▶️ **${q.current.title}**`);
     q.tracks.forEach((t, i) => lines.push(`${i + 1}. ${t.title}`));
-    return message.reply(lines.join('\n').slice(0, 1900));
+    return interaction.reply(lines.join('\n').slice(0, 1900));
   }
 });
+
+// --- Lifecycle --------------------------------------------------------------
 
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
