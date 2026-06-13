@@ -25,13 +25,10 @@ const {
 const stats = require('./stats');
 const cookies = require('./cookies');
 const cache = require('./cache');
+const proxies = require('./proxies');
 
 const BRAND = 0x14b8a6;
 const STATS_GUILD_ID = process.env.STATS_GUILD_ID;
-// Optional proxy (e.g. a residential gateway) used for the bot-walled YouTube
-// *extraction* step. Audio bytes still download over the host's own IP, so the
-// proxy only carries KBs/song. Never logged.
-const PROXY = process.env.PROXY || null;
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
@@ -52,8 +49,6 @@ function getQueue(guildId) {
     current: null,
     playing: false,
     textChannel: null,
-    // Play even if a subscriber isn't "active" the instant play() is called,
-    // otherwise the player silently pauses and you hear nothing.
     player: createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } }),
   };
 
@@ -72,7 +67,7 @@ function getQueue(guildId) {
 
 // --- YouTube helpers --------------------------------------------------------
 
-function runSearch(query, cookieFile) {
+function runSearch(query, cookieFile, proxy) {
   return new Promise((resolve, reject) => {
     const args = [
       `ytsearch1:${query}`,
@@ -80,7 +75,7 @@ function runSearch(query, cookieFile) {
       '--no-warnings',
       '--print', '%(title)s ::: https://www.youtube.com/watch?v=%(id)s',
     ];
-    if (PROXY) args.push('--proxy', PROXY);
+    if (proxy) args.push('--proxy', proxy);
     if (cookieFile) args.push('--cookies', cookieFile);
 
     const proc = spawn('yt-dlp', args);
@@ -98,39 +93,39 @@ function runSearch(query, cookieFile) {
   });
 }
 
-// Search YouTube, rotating cookies and retiring any that get bot-walled.
+// Search YouTube, rotating cookies + proxies and retiring any that get walled.
 async function searchYouTube(query) {
   let lastErr;
-  for (let i = 0; i < Math.max(1, cookies.count()); i++) {
+  const attempts = Math.max(1, cookies.count(), proxies.count());
+  for (let i = 0; i < attempts; i++) {
     const cookieFile = cookies.next();
+    const proxy = proxies.next();
     try {
-      const res = await runSearch(query, cookieFile);
+      const res = await runSearch(query, cookieFile, proxy);
       cookies.reportSuccess(cookieFile);
+      proxies.reportSuccess(proxy);
       stats.recordSearch();
       return res;
     } catch (e) {
       lastErr = e;
-      if (cookieFile && isBotWall(e.message)) { cookies.reportFailure(cookieFile); continue; }
-      break; // no cookie, or a non-wall error (e.g. genuinely no results)
+      if (isBotWall(e.message)) {
+        if (cookieFile) cookies.reportFailure(cookieFile);
+        if (proxy) proxies.reportFailure(proxy);
+        continue;
+      }
+      break; // genuine "no results" etc.
     }
   }
   throw lastErr || new Error('search failed');
 }
 
 // --- Streaming pipeline -----------------------------------------------------
-//
-// Cost-optimised for residential proxies (billed per GB): the *extraction* (the
-// small, bot-walled youtube.com step) goes through the proxy, but the actual
-// audio is pulled straight from googlevideo's CDN by ffmpeg over the host's own
-// IP — so the proxy only carries KBs/song, not MBs. If a media URL turns out to
-// be IP-locked to the extraction IP, we fall back to downloading that one song
-// through the proxy (full bandwidth).
 
-// Extraction: resolve the direct googlevideo media URL (small; via proxy).
-function getDirectUrl(url, cookieFile) {
+// Extraction: resolve the direct googlevideo media URL (via the chosen proxy).
+function getDirectUrl(url, cookieFile, proxy) {
   return new Promise((resolve, reject) => {
     const args = ['-f', 'bestaudio', '--get-url', '--no-playlist', '--no-warnings'];
-    if (PROXY) args.push('--proxy', PROXY);
+    if (proxy) args.push('--proxy', proxy);
     if (cookieFile) args.push('--cookies', cookieFile);
     args.push(url);
 
@@ -148,8 +143,8 @@ function getDirectUrl(url, cookieFile) {
   });
 }
 
-// Resolve with ffmpeg.stdout once it produces its first bytes (read in paused
-// mode so nothing is dropped). Rejects if a source process dies first.
+// Resolve with ffmpeg.stdout once it produces its first bytes (paused-mode read
+// so nothing is dropped). Rejects if a source process dies first.
 function firstBytes(ffmpeg, procs, getErr) {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -179,7 +174,7 @@ function firstBytes(ffmpeg, procs, getErr) {
   });
 }
 
-// Cheap path: ffmpeg pulls the media URL directly over the host's IP (no proxy).
+// Download path A (no proxy): ffmpeg pulls the media URL over the host's own IP.
 function streamUrlDirect(mediaUrl) {
   const ffmpeg = spawn('ffmpeg', [
     '-hide_banner', '-loglevel', 'error',
@@ -189,10 +184,11 @@ function streamUrlDirect(mediaUrl) {
   return firstBytes(ffmpeg, [ffmpeg]);
 }
 
-// Fallback path: download through the proxy via yt-dlp (full bandwidth).
-function streamViaProxy(url, cookieFile) {
+// Download path B (proxy): yt-dlp downloads through the SAME sticky proxy used
+// for extraction, so the IP matches the IP-locked media URL.
+function streamViaProxy(url, cookieFile, proxy) {
   const ytArgs = ['-f', 'bestaudio', '-o', '-', '--no-playlist', '--quiet', '--no-warnings'];
-  if (PROXY) ytArgs.push('--proxy', PROXY);
+  if (proxy) ytArgs.push('--proxy', proxy);
   if (cookieFile) ytArgs.push('--cookies', cookieFile);
   ytArgs.push(url);
 
@@ -211,8 +207,8 @@ function streamViaProxy(url, cookieFile) {
   return firstBytes(ffmpeg, [ytdlp, ffmpeg], () => ytErr.trim());
 }
 
-// Returns { stream, id, cached } or null. Checks the on-disk cache first; on a
-// miss, extracts (via proxy) and downloads, rotating cookies on bot-walls.
+// Returns { stream, id, cached } or null. Cache first; else rotate
+// cookie+proxy pairs, using ONE proxy per attempt for extract AND download.
 async function createTrackStream(url) {
   const id = cache.videoId(url);
   const hit = cache.cachedPath(id);
@@ -222,51 +218,49 @@ async function createTrackStream(url) {
   }
 
   let lastErr;
-  for (let i = 0; i < Math.max(1, cookies.count()); i++) {
+  const attempts = Math.max(1, cookies.count(), proxies.count());
+  for (let i = 0; i < attempts; i++) {
     const cookieFile = cookies.next();
-    const tag = cookieFile ? path.basename(cookieFile) : 'no-cookie';
+    const proxy = proxies.next();
+    const tag = `${proxy ? proxies.label(proxy) : 'no-proxy'}/${cookieFile ? path.basename(cookieFile) : 'no-cookie'}`;
 
     let directUrl;
     try {
-      directUrl = await getDirectUrl(url, cookieFile); // small, via proxy; clears the wall
+      directUrl = await getDirectUrl(url, cookieFile, proxy);
     } catch (e) {
       lastErr = e;
       console.error('[extract]', tag, '-', e.message.split('\n')[0]);
-      if (cookieFile && isBotWall(e.message)) { cookies.reportFailure(cookieFile); continue; }
-      break; // no cookie, or a non-wall error (e.g. unavailable video)
+      if (isBotWall(e.message)) {
+        if (cookieFile) cookies.reportFailure(cookieFile);
+        if (proxy) proxies.reportFailure(proxy);
+        continue;
+      }
+      break; // non-wall error (e.g. unavailable video)
     }
 
-    // Cheap path: pull the audio straight from the CDN over our own IP.
     try {
-      const stream = await streamUrlDirect(directUrl);
+      // With a proxy the media URL is IP-locked to it → download via the same
+      // proxy. Without a proxy (home IP), pull it straight from the CDN.
+      const stream = proxy
+        ? await streamViaProxy(url, cookieFile, proxy)
+        : await streamUrlDirect(directUrl);
       cookies.reportSuccess(cookieFile);
-      console.log('[stream] direct-from-host (cheap)');
+      proxies.reportSuccess(proxy);
+      console.log(`[stream] ok via ${tag}`);
       return { stream, id, cached: false };
     } catch (e) {
-      console.warn('[stream] direct download failed (likely IP-locked):', e.message.split('\n')[0]);
+      lastErr = e;
+      console.error('[stream]', tag, '-', e.message.split('\n')[0]);
+      if (proxy) proxies.reportFailure(proxy);
+      if (isBotWall(e.message) && cookieFile) cookies.reportFailure(cookieFile);
+      continue;
     }
-
-    // Fallback: download through the proxy (full bandwidth) — only when needed.
-    if (PROXY) {
-      try {
-        const stream = await streamViaProxy(url, cookieFile);
-        cookies.reportSuccess(cookieFile);
-        console.log('[stream] via-proxy download (full bandwidth)');
-        return { stream, id, cached: false };
-      } catch (e) {
-        lastErr = e;
-        console.error('[stream]', tag, '- proxy dl:', e.message.split('\n')[0]);
-        if (cookieFile && isBotWall(e.message)) { cookies.reportFailure(cookieFile); continue; }
-      }
-    }
-    break;
   }
   if (lastErr) console.error('[stream] giving up:', lastErr.message.split('\n')[0]);
   return null;
 }
 
-// Play the next queued track. `announce` posts a channel embed (auto-advance);
-// the /play handler suppresses it and replies to the interaction instead.
+// Play the next queued track. `announce` posts a channel embed (auto-advance).
 async function playNext(guildId, announce = true) {
   const q = getQueue(guildId);
   const next = q.tracks.shift();
@@ -282,7 +276,7 @@ async function playNext(guildId, announce = true) {
   const res = await createTrackStream(next.url);
   if (!res) {
     if (announce && q.textChannel) q.textChannel.send({ embeds: [failEmbed(next)] }).catch(() => {});
-    return playNext(guildId, announce); // skip the dead track, try the next
+    return playNext(guildId, announce);
   }
 
   // Fresh downloads are tee'd into the cache as they play; cache hits stream as-is.
@@ -319,7 +313,7 @@ function failEmbed(track) {
     .setColor(0xef4444)
     .setAuthor({ name: '⚠️ Skipped' })
     .setTitle((track.title || 'Unknown').slice(0, 256))
-    .setDescription('YouTube blocked this request (no working cookies available right now).')
+    .setDescription('YouTube blocked this request (no working cookies/proxies available right now).')
     .setFooter({ text: 'audiomonkey' });
 }
 
@@ -344,7 +338,7 @@ const STATS_COMMAND = { name: 'stats', description: 'Show usage stats (owner onl
 
 client.once(Events.ClientReady, async (c) => {
   console.log(`✅ Logged in as ${c.user.tag}`);
-  console.log(`Cookie pool: ${cookies.count()} file(s). Proxy: ${PROXY ? 'configured' : 'none'}.`);
+  console.log(`Cookies: ${cookies.count()} | Proxies: ${proxies.count()} (${proxies.SCHEME}) | Cache: ${cache.status().count}`);
   try {
     await c.application.commands.set(PUBLIC_COMMANDS);
     console.log(`Registered ${PUBLIC_COMMANDS.length} global commands.`);
@@ -373,9 +367,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (!STATS_GUILD_ID || interaction.guildId !== STATS_GUILD_ID) {
       return interaction.reply({ content: "That command isn't available here.", flags: MessageFlags.Ephemeral });
     }
-    const c = cookies.status();
+    const ck = cookies.status();
+    const px = proxies.status();
     const cc = cache.status();
-    const text = `${stats.summary(client.guilds.cache.size)}\n• Cookies: **${c.available}/${c.total}** available\n• Proxy: **${PROXY ? 'on' : 'off'}**\n• Cache: **${cc.count}** songs (${cc.mb} MB)`;
+    const text = `${stats.summary(client.guilds.cache.size)}`
+      + `\n• Cookies: **${ck.available}/${ck.total}** available`
+      + `\n• Proxies: **${px.available}/${px.total}** available`
+      + `\n• Cache: **${cc.count}** songs (${cc.mb} MB)`;
     return interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
   }
 
@@ -427,11 +425,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     const ok = await playNext(interaction.guild.id, false);
     if (!ok) {
-      const c = cookies.status();
-      const why = c.total
-        ? `all ${c.total} YouTube cookie${c.total === 1 ? '' : 's'} are cooling down`
-        : 'the server has no YouTube cookies configured';
-      return interaction.editReply(`❌ YouTube blocked this request (${why}). Try again shortly.`);
+      return interaction.editReply('❌ YouTube blocked this request (all cookies/proxies are cooling down). Try again shortly.');
     }
     return interaction.editReply({ embeds: [trackEmbed(track, '🎶 Now playing')] });
   }
