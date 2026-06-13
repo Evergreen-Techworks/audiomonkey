@@ -1,6 +1,6 @@
 # audiomonkey — Free Open-Source Discord Music Bot 🎵
 
-[![Add to Discord](https://img.shields.io/badge/add%20to%20discord-invite%20the%20bot-14b8a6?logo=discord&logoColor=white)](https://discord.com/oauth2/authorize?client_id=1102027846106480650&permissions=36785152&scope=bot%20applications.commands)
+[![Add to Discord](https://img.shields.io/badge/add%20to%20discord-invite%20the%20bot-14b8a6?logo=discord&logoColor=white)](https://discord.com/oauth2/authorize?client_id=1102027846106480650&permissions=3165184&scope=bot%20applications.commands)
 [![Discord](https://img.shields.io/badge/discord-join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/WC4FGuZFxY)
 [![License](https://img.shields.io/badge/license-MIT-14b8a6)](LICENSE)
 [![Node](https://img.shields.io/badge/node-18%2B-0d9488?logo=node.js&logoColor=white)](https://nodejs.org)
@@ -19,7 +19,7 @@
 
 ## ➕ Add it to your server
 
-👉 **[Invite audiomonkey to your Discord server](https://discord.com/oauth2/authorize?client_id=1102027846106480650&permissions=36785152&scope=bot%20applications.commands)**
+👉 **[Invite audiomonkey to your Discord server](https://discord.com/oauth2/authorize?client_id=1102027846106480650&permissions=3165184&scope=bot%20applications.commands)**
 
 Then join a voice channel and type:
 
@@ -155,12 +155,13 @@ bot-walled *extraction* through a proxy. Played songs are cached to `cache/`
 ## 📊 Usage stats
 
 audiomonkey keeps lightweight counters (tracks played, searches, commands,
-per-server plays, uptime) in `stats.json`. The `/stats` command prints them, but
-it's **only registered in the server whose ID you put in `STATS_GUILD_ID`** — so
-it never even appears for regular users elsewhere.
+per-server plays, uptime) in `stats.json`. The `/stats` command is **private**:
+it's registered *only* in your `STATS_GUILD_ID` server (so it never appears
+anywhere else) and only runs for `OWNER_ID` (so only you can use it).
 
 ```env
 STATS_GUILD_ID=123456789012345678   # your "home" server's ID
+OWNER_ID=123456789012345678         # your Discord user ID
 ```
 
 ---

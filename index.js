@@ -28,7 +28,9 @@ const cache = require('./cache');
 const proxies = require('./proxies');
 
 const BRAND = 0x14b8a6;
-const STATS_GUILD_ID = process.env.STATS_GUILD_ID;
+const STATS_GUILD_ID = process.env.STATS_GUILD_ID; // server where /stats is registered
+const OWNER_ID = process.env.OWNER_ID;             // user allowed to run /stats
+const MAX_TRIES = 4; // how many cookie/proxy combos to try before giving up
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
@@ -52,7 +54,6 @@ function getQueue(guildId) {
     player: createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } }),
   };
 
-  q.player.on('stateChange', (o, n) => console.log(`[player] ${o.status} -> ${n.status}`));
   q.player.on(AudioPlayerStatus.Idle, () => {
     playNext(guildId).catch((e) => console.error('[playNext]', e.message));
   });
@@ -93,11 +94,11 @@ function runSearch(query, cookieFile, proxy) {
   });
 }
 
-// Search YouTube, rotating cookies + proxies and retiring any that get walled.
+// Search YouTube, rotating cookies + proxies and cooling down any that get walled.
 async function searchYouTube(query) {
   let lastErr;
-  const attempts = Math.max(1, cookies.count(), proxies.count());
-  for (let i = 0; i < attempts; i++) {
+  const tries = Math.min(MAX_TRIES, Math.max(1, cookies.count(), proxies.count()));
+  for (let i = 0; i < tries; i++) {
     const cookieFile = cookies.next();
     const proxy = proxies.next();
     try {
@@ -117,30 +118,6 @@ async function searchYouTube(query) {
     }
   }
   throw lastErr || new Error('search failed');
-}
-
-// --- Streaming pipeline -----------------------------------------------------
-
-// Extraction: resolve the direct googlevideo media URL (via the chosen proxy).
-function getDirectUrl(url, cookieFile, proxy) {
-  return new Promise((resolve, reject) => {
-    const args = ['-f', 'bestaudio', '--get-url', '--no-playlist', '--no-warnings'];
-    if (proxy) args.push('--proxy', proxy);
-    if (cookieFile) args.push('--cookies', cookieFile);
-    args.push(url);
-
-    const proc = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    let out = '';
-    let err = '';
-    proc.stdout.on('data', (d) => (out += d));
-    proc.stderr.on('data', (d) => (err += d));
-    proc.on('error', reject);
-    proc.on('close', (code) => {
-      const direct = out.trim().split('\n').filter(Boolean)[0];
-      if (code !== 0 || !direct) return reject(new Error(err.trim() || `extract exit ${code}`));
-      resolve(direct);
-    });
-  });
 }
 
 // Resolve with ffmpeg.stdout once it produces its first bytes (paused-mode read
@@ -174,19 +151,10 @@ function firstBytes(ffmpeg, procs, getErr) {
   });
 }
 
-// Download path A (no proxy): ffmpeg pulls the media URL over the host's own IP.
-function streamUrlDirect(mediaUrl) {
-  const ffmpeg = spawn('ffmpeg', [
-    '-hide_banner', '-loglevel', 'error',
-    '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-    '-i', mediaUrl, '-vn', '-c:a', 'libopus', '-b:a', '128k', '-f', 'ogg', 'pipe:1',
-  ], { stdio: ['ignore', 'pipe', 'pipe'] });
-  return firstBytes(ffmpeg, [ffmpeg]);
-}
-
-// Download path B (proxy): yt-dlp downloads through the SAME sticky proxy used
-// for extraction, so the IP matches the IP-locked media URL.
-function streamViaProxy(url, cookieFile, proxy) {
+// Download a track as an Ogg/Opus stream: yt-dlp -> ffmpeg, optionally through a
+// proxy. With a sticky proxy, extraction + download share one IP (no IP-lock).
+// Resolves only once audio actually flows.
+function streamDownload(url, cookieFile, proxy) {
   const ytArgs = ['-f', 'bestaudio', '-o', '-', '--no-playlist', '--quiet', '--no-warnings'];
   if (proxy) ytArgs.push('--proxy', proxy);
   if (cookieFile) ytArgs.push('--cookies', cookieFile);
@@ -207,8 +175,8 @@ function streamViaProxy(url, cookieFile, proxy) {
   return firstBytes(ffmpeg, [ytdlp, ffmpeg], () => ytErr.trim());
 }
 
-// Returns { stream, id, cached } or null. Cache first; else rotate
-// cookie+proxy pairs, using ONE proxy per attempt for extract AND download.
+// Returns { stream, id, cached } or null. Serves from cache when possible; else
+// rotates cookie+proxy pairs (one proxy per attempt for extract AND download).
 async function createTrackStream(url) {
   const id = cache.videoId(url);
   const hit = cache.cachedPath(id);
@@ -218,42 +186,22 @@ async function createTrackStream(url) {
   }
 
   let lastErr;
-  const attempts = Math.max(1, cookies.count(), proxies.count());
-  for (let i = 0; i < attempts; i++) {
+  const tries = Math.min(MAX_TRIES, Math.max(1, cookies.count(), proxies.count()));
+  for (let i = 0; i < tries; i++) {
     const cookieFile = cookies.next();
     const proxy = proxies.next();
     const tag = `${proxy ? proxies.label(proxy) : 'no-proxy'}/${cookieFile ? path.basename(cookieFile) : 'no-cookie'}`;
-
-    let directUrl;
     try {
-      directUrl = await getDirectUrl(url, cookieFile, proxy);
-    } catch (e) {
-      lastErr = e;
-      console.error('[extract]', tag, '-', e.message.split('\n')[0]);
-      if (isBotWall(e.message)) {
-        if (cookieFile) cookies.reportFailure(cookieFile);
-        if (proxy) proxies.reportFailure(proxy);
-        continue;
-      }
-      break; // non-wall error (e.g. unavailable video)
-    }
-
-    try {
-      // With a proxy the media URL is IP-locked to it → download via the same
-      // proxy. Without a proxy (home IP), pull it straight from the CDN.
-      const stream = proxy
-        ? await streamViaProxy(url, cookieFile, proxy)
-        : await streamUrlDirect(directUrl);
+      const stream = await streamDownload(url, cookieFile, proxy);
       cookies.reportSuccess(cookieFile);
       proxies.reportSuccess(proxy);
-      console.log(`[stream] ok via ${tag}`);
+      console.log('[stream] ok via', tag);
       return { stream, id, cached: false };
     } catch (e) {
       lastErr = e;
       console.error('[stream]', tag, '-', e.message.split('\n')[0]);
-      if (proxy) proxies.reportFailure(proxy);
       if (isBotWall(e.message) && cookieFile) cookies.reportFailure(cookieFile);
-      continue;
+      if (proxy) proxies.reportFailure(proxy);
     }
   }
   if (lastErr) console.error('[stream] giving up:', lastErr.message.split('\n')[0]);
@@ -341,14 +289,12 @@ client.once(Events.ClientReady, async (c) => {
   console.log(`Cookies: ${cookies.count()} | Proxies: ${proxies.count()} (${proxies.SCHEME}) | Cache: ${cache.status().count}`);
   try {
     await c.application.commands.set(PUBLIC_COMMANDS);
-    console.log(`Registered ${PUBLIC_COMMANDS.length} global commands.`);
+    // /stats is registered ONLY in the owner's server, so it never appears elsewhere.
     if (STATS_GUILD_ID) {
       const g = await c.guilds.fetch(STATS_GUILD_ID).catch(() => null);
-      if (g) {
-        await g.commands.set([...PUBLIC_COMMANDS, STATS_COMMAND]);
-        console.log(`Registered guild commands in "${g.name}" (incl. /stats).`);
-      }
+      if (g) await g.commands.set([...PUBLIC_COMMANDS, STATS_COMMAND]);
     }
+    console.log('Slash commands registered.');
   } catch (e) {
     console.error('Command registration failed:', e.message);
   }
@@ -364,7 +310,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
   stats.recordCommand(cmd);
 
   if (cmd === 'stats') {
-    if (!STATS_GUILD_ID || interaction.guildId !== STATS_GUILD_ID) {
+    // Owner-only, and only in the configured server.
+    const allowed = STATS_GUILD_ID
+      && interaction.guildId === STATS_GUILD_ID
+      && (!OWNER_ID || interaction.user.id === OWNER_ID);
+    if (!allowed) {
       return interaction.reply({ content: "That command isn't available here.", flags: MessageFlags.Ephemeral });
     }
     const ck = cookies.status();
@@ -407,13 +357,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         guildId: interaction.guild.id,
         adapterCreator: interaction.guild.voiceAdapterCreator,
       });
-      connection.on('stateChange', (o, n) => console.log(`[voice] ${o.status} -> ${n.status}`));
       connection.on('error', (e) => console.error('[voice] error:', e.message));
       connection.subscribe(q.player);
       try {
         await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-      } catch (e) {
-        console.error('[voice] join failed:', e?.message, '| final state:', connection.state.status);
+      } catch {
         connection.destroy();
         queues.delete(interaction.guild.id);
         return interaction.editReply('❌ Failed to join the voice channel.');
