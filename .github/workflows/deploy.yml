@@ -37,7 +37,7 @@ jobs:
             --instance-ids "$INSTANCE_ID" \
             --document-name AWS-RunShellScript \
             --comment "Deploy ${GITHUB_SHA::7}" \
-            --parameters commands='["set -eux","cd /home/ubuntu/audiomonkey","sudo -u ubuntu git fetch --all -q","sudo -u ubuntu git reset --hard origin/main","sudo -u ubuntu npm ci --omit=dev","systemctl restart audiomonkey || true","sudo -u ubuntu git rev-parse --short HEAD"]' \
+            --parameters commands='["set -eux","cd /home/ubuntu/audiomonkey","sudo -u ubuntu git fetch --all -q","sudo -u ubuntu git reset --hard origin/main","sudo -u ubuntu npm install --omit=dev --no-audit --no-fund","systemctl restart audiomonkey || true","sudo -u ubuntu git rev-parse --short HEAD"]' \
             --query 'Command.CommandId' --output text)
           echo "SSM CommandId: $CMD_ID"
 
