@@ -1,0 +1,17 @@
+[Unit]
+Description=audiomonkey Discord music bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__DIR__
+ExecStart=/usr/bin/node --env-file=.env index.js
+Restart=on-failure
+RestartSec=5
+# yt-dlp + ffmpeg live in /usr/local/bin and /usr/bin
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target
