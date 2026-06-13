@@ -1,5 +1,6 @@
 # audiomonkey — Free Open-Source Discord Music Bot 🎵
 
+[![Add to Discord](https://img.shields.io/badge/add%20to%20discord-invite%20the%20bot-14b8a6?logo=discord&logoColor=white)](https://discord.com/oauth2/authorize?client_id=1102027846106480650&permissions=36785152&scope=bot)
 [![Discord](https://img.shields.io/badge/discord-join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/WC4FGuZFxY)
 [![License](https://img.shields.io/badge/license-MIT-14b8a6)](LICENSE)
 [![Node](https://img.shields.io/badge/node-18%2B-0d9488?logo=node.js&logoColor=white)](https://nodejs.org)
