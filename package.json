@@ -8,9 +8,9 @@
     "start": "node --env-file=.env index.js"
   },
   "dependencies": {
-    "@discordjs/voice": "^0.18.0",
+    "@discordjs/voice": "^0.19.2",
     "@noble/ciphers": "^1.2.0",
-    "discord.js": "^14.16.3",
+    "discord.js": "^14.26.4",
     "libsodium-wrappers": "^0.7.15"
   }
 }

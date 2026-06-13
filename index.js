@@ -232,6 +232,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
       connection.on('stateChange', (o, n) => console.log(`[voice] ${o.status} -> ${n.status}`));
       connection.on('error', (e) => console.error('[voice] error:', e.message));
+      connection.on('debug', (m) => console.log('[voice-debug]', m));
       connection.subscribe(q.player);
       try {
         await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
