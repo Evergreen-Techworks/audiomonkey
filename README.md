@@ -146,6 +146,10 @@ puts any that get bot-walled on a cooldown, retrying them once they recover.
 
 > Cookie files are account secrets — they're gitignored and never committed.
 
+**Proxy + cache.** Set `PROXY` in `.env` (see `.env.example`) to route the
+bot-walled *extraction* through a proxy. Played songs are cached to `cache/`
+(gitignored) and replayed straight from disk — no re-download, no proxy traffic.
+
 ---
 
 ## 📊 Usage stats

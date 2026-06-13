@@ -1,6 +1,7 @@
 'use strict';
 
 const { spawn } = require('node:child_process');
+const fs = require('node:fs');
 const path = require('node:path');
 const {
   Client,
@@ -23,6 +24,7 @@ const {
 } = require('@discordjs/voice');
 const stats = require('./stats');
 const cookies = require('./cookies');
+const cache = require('./cache');
 
 const BRAND = 0x14b8a6;
 const STATS_GUILD_ID = process.env.STATS_GUILD_ID;
@@ -209,8 +211,16 @@ function streamViaProxy(url, cookieFile) {
   return firstBytes(ffmpeg, [ytdlp, ffmpeg], () => ytErr.trim());
 }
 
-// Returns a playable Ogg/Opus stream, rotating cookies on bot-walls. null = all failed.
+// Returns { stream, id, cached } or null. Checks the on-disk cache first; on a
+// miss, extracts (via proxy) and downloads, rotating cookies on bot-walls.
 async function createTrackStream(url) {
+  const id = cache.videoId(url);
+  const hit = cache.cachedPath(id);
+  if (hit) {
+    console.log('[cache] hit', id);
+    return { stream: fs.createReadStream(hit), id, cached: true };
+  }
+
   let lastErr;
   for (let i = 0; i < Math.max(1, cookies.count()); i++) {
     const cookieFile = cookies.next();
@@ -231,7 +241,7 @@ async function createTrackStream(url) {
       const stream = await streamUrlDirect(directUrl);
       cookies.reportSuccess(cookieFile);
       console.log('[stream] direct-from-host (cheap)');
-      return stream;
+      return { stream, id, cached: false };
     } catch (e) {
       console.warn('[stream] direct download failed (likely IP-locked):', e.message.split('\n')[0]);
     }
@@ -242,7 +252,7 @@ async function createTrackStream(url) {
         const stream = await streamViaProxy(url, cookieFile);
         cookies.reportSuccess(cookieFile);
         console.log('[stream] via-proxy download (full bandwidth)');
-        return stream;
+        return { stream, id, cached: false };
       } catch (e) {
         lastErr = e;
         console.error('[stream]', tag, '- proxy dl:', e.message.split('\n')[0]);
@@ -269,13 +279,15 @@ async function playNext(guildId, announce = true) {
   q.playing = true;
   q.current = next;
 
-  const stream = await createTrackStream(next.url);
-  if (!stream) {
+  const res = await createTrackStream(next.url);
+  if (!res) {
     if (announce && q.textChannel) q.textChannel.send({ embeds: [failEmbed(next)] }).catch(() => {});
     return playNext(guildId, announce); // skip the dead track, try the next
   }
 
-  q.player.play(createAudioResource(stream, { inputType: StreamType.OggOpus }));
+  // Fresh downloads are tee'd into the cache as they play; cache hits stream as-is.
+  const playable = res.cached ? res.stream : cache.teeToCache(res.stream, res.id);
+  q.player.play(createAudioResource(playable, { inputType: StreamType.OggOpus }));
 
   const guild = q.textChannel?.guild;
   if (guild) stats.recordPlay(guild.id, guild.name);
@@ -362,7 +374,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.reply({ content: "That command isn't available here.", flags: MessageFlags.Ephemeral });
     }
     const c = cookies.status();
-    const text = `${stats.summary(client.guilds.cache.size)}\n• Cookies: **${c.available}/${c.total}** available\n• Proxy: **${PROXY ? 'on' : 'off'}**`;
+    const cc = cache.status();
+    const text = `${stats.summary(client.guilds.cache.size)}\n• Cookies: **${c.available}/${c.total}** available\n• Proxy: **${PROXY ? 'on' : 'off'}**\n• Cache: **${cc.count}** songs (${cc.mb} MB)`;
     return interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
   }
 
