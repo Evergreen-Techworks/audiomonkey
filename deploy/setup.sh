@@ -12,6 +12,17 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_USER="$(id -un)"
 
+# Create swap FIRST — a t3.nano has only 512 MB RAM, and installing Node or
+# running npm without swap gets the process OOM-killed mid-unpack.
+echo "==> Ensuring 1 GB swap (before anything memory-hungry)"
+if ! sudo swapon --show | grep -q /swapfile; then
+  [ -f /swapfile ] || sudo fallocate -l 1G /swapfile
+  sudo chmod 600 /swapfile
+  sudo mkswap /swapfile >/dev/null 2>&1 || true
+  sudo swapon /swapfile
+  grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+fi
+
 echo "==> Installing system packages (ffmpeg, git, curl)"
 sudo apt-get update -y
 sudo apt-get install -y ffmpeg git curl ca-certificates
@@ -26,15 +37,6 @@ echo "==> Installing yt-dlp (self-updating standalone binary)"
 sudo curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
   -o /usr/local/bin/yt-dlp
 sudo chmod a+rx /usr/local/bin/yt-dlp
-
-echo "==> Ensuring 1 GB swap (t3.nano only has 512 MB RAM)"
-if [ ! -f /swapfile ]; then
-  sudo fallocate -l 1G /swapfile
-  sudo chmod 600 /swapfile
-  sudo mkswap /swapfile
-  sudo swapon /swapfile
-  echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
-fi
 
 echo "==> Installing app dependencies"
 cd "$REPO_DIR"
