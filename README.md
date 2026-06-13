@@ -15,7 +15,7 @@
 
 ## ➕ Add it to your server
 
-👉 **[Invite audiomonkey to your Discord server](https://discord.com/oauth2/authorize?client_id=YOUR_APPLICATION_ID&permissions=36785152&scope=bot)**
+👉 **[Invite audiomonkey to your Discord server](https://discord.com/oauth2/authorize?client_id=1102027846106480650&permissions=36785152&scope=bot)**
 
 Then join a voice channel and type:
 
@@ -23,7 +23,7 @@ Then join a voice channel and type:
 !play never gonna give you up
 ```
 
-> Replace `YOUR_APPLICATION_ID` with the bot's Application ID (Discord Dev Portal → your app → General Information). Prefer to run your own copy? See [Self-host](#-self-host-your-own-discord-music-bot) below.
+> This adds the official **audiomonkey** bot — nothing to install. Want to run your own copy instead? Swap in your bot's Application ID (Dev Portal → General Information) and see [Self-host](#-self-host-your-own-discord-music-bot) below.
 
 ---
 
