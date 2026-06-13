@@ -7,6 +7,7 @@ const {
   Events,
   ApplicationCommandOptionType,
   MessageFlags,
+  EmbedBuilder,
 } = require('discord.js');
 const {
   joinVoiceChannel,
@@ -15,13 +16,15 @@ const {
   StreamType,
   AudioPlayerStatus,
   VoiceConnectionStatus,
+  NoSubscriberBehavior,
   entersState,
   getVoiceConnection,
 } = require('@discordjs/voice');
 const stats = require('./stats');
 
+const BRAND = 0x14b8a6; // teal accent for embeds
+
 // Server (guild) ID where the private /stats command is registered + allowed.
-// Leave unset to disable it entirely.
 const STATS_GUILD_ID = process.env.STATS_GUILD_ID;
 
 // Slash commands need no privileged intents — just guild + voice state.
@@ -42,9 +45,13 @@ function getQueue(guildId) {
     current: null,   // the track currently playing
     playing: false,
     textChannel: null,
-    player: createAudioPlayer(),
+    // NoSubscriberBehavior.Play: keep transmitting even if the subscription
+    // isn't "active" at the exact instant play() is called — without this the
+    // player silently pauses and you hear nothing.
+    player: createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } }),
   };
 
+  q.player.on('stateChange', (o, n) => console.log(`[player] ${o.status} -> ${n.status}`));
   q.player.on(AudioPlayerStatus.Idle, () => {
     q.current = null;
     playNext(guildId);
@@ -92,32 +99,38 @@ function searchYouTube(query) {
 function createTrackStream(url) {
   const ytdlp = spawn('yt-dlp', [
     '-f', 'bestaudio',
-    '-o', '-',          // write media to stdout
+    '-o', '-',          // write media to stdout (never to disk)
     '--no-playlist',
     '--quiet',
     '--no-warnings',
     url,
-  ], { stdio: ['ignore', 'pipe', 'ignore'] });
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
   const ffmpeg = spawn('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error',
     '-i', 'pipe:0',
     '-vn',              // drop any video stream
     '-c:a', 'libopus',
     '-b:a', '128k',
     '-f', 'ogg',
     'pipe:1',
-  ], { stdio: ['pipe', 'pipe', 'ignore'] });
+  ], { stdio: ['pipe', 'pipe', 'pipe'] });
 
   ytdlp.stdout.pipe(ffmpeg.stdin);
   // A consumer that stops early (skip/stop) closes the pipe; swallow EPIPE.
   ytdlp.stdout.on('error', () => {});
   ffmpeg.stdin.on('error', () => {});
 
+  ytdlp.stderr.on('data', (d) => console.error('[yt-dlp]', d.toString().trim()));
+  ffmpeg.stderr.on('data', (d) => console.error('[ffmpeg]', d.toString().trim()));
+  ytdlp.on('close', (c) => { if (c) console.error('[yt-dlp] exited with', c); });
+  ffmpeg.on('close', (c) => { if (c) console.error('[ffmpeg] exited with', c); });
+
   return ffmpeg.stdout;
 }
 
 // Play the next queued track. `announce` controls the channel "Now playing"
-// message — the /play handler suppresses it (it replies to the interaction
+// embed — the /play handler suppresses it (it replies to the interaction
 // instead), while auto-advance between tracks announces.
 function playNext(guildId, announce = true) {
   const q = getQueue(guildId);
@@ -139,8 +152,27 @@ function playNext(guildId, announce = true) {
   if (guild) stats.recordPlay(guild.id, guild.name);
 
   if (announce && q.textChannel) {
-    q.textChannel.send(`🎶 Now playing: **${next.title}**`).catch(() => {});
+    q.textChannel.send({ embeds: [trackEmbed(next, '🎶 Now playing')] }).catch(() => {});
   }
+}
+
+// --- Embeds -----------------------------------------------------------------
+
+function ytThumb(url) {
+  const m = url.match(/[?&]v=([\w-]{11})/) || url.match(/youtu\.be\/([\w-]{11})/);
+  return m ? `https://i.ytimg.com/vi/${m[1]}/hqdefault.jpg` : null;
+}
+
+function trackEmbed(track, author) {
+  const e = new EmbedBuilder()
+    .setColor(BRAND)
+    .setAuthor({ name: author })
+    .setTitle((track.title || 'Unknown').slice(0, 256))
+    .setFooter({ text: 'audiomonkey' });
+  if (/^https?:\/\//.test(track.url)) e.setURL(track.url);
+  const thumb = ytThumb(track.url);
+  if (thumb) e.setThumbnail(thumb);
+  return e;
 }
 
 // --- Slash command definitions ---------------------------------------------
@@ -165,11 +197,8 @@ const STATS_COMMAND = { name: 'stats', description: 'Show usage stats (owner onl
 client.once(Events.ClientReady, async (c) => {
   console.log(`✅ Logged in as ${c.user.tag}`);
   try {
-    // Global commands (every server; can take a little while to propagate).
     await c.application.commands.set(PUBLIC_COMMANDS);
     console.log(`Registered ${PUBLIC_COMMANDS.length} global commands.`);
-
-    // Owner server: register instantly + add the private /stats command.
     if (STATS_GUILD_ID) {
       const g = await c.guilds.fetch(STATS_GUILD_ID).catch(() => null);
       if (g) {
@@ -232,7 +261,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
       connection.on('stateChange', (o, n) => console.log(`[voice] ${o.status} -> ${n.status}`));
       connection.on('error', (e) => console.error('[voice] error:', e.message));
-      connection.on('debug', (m) => console.log('[voice-debug]', m));
       connection.subscribe(q.player);
       try {
         await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
@@ -245,10 +273,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (q.playing) {
-      return interaction.editReply(`➕ Queued: **${track.title}**`);
+      return interaction.editReply({ embeds: [trackEmbed(track, '➕ Added to queue')] });
     }
     playNext(interaction.guild.id, false);
-    return interaction.editReply(`🎶 Now playing: **${track.title}**`);
+    return interaction.editReply({ embeds: [trackEmbed(track, '🎶 Now playing')] });
   }
 
   if (cmd === 'skip') {
@@ -276,10 +304,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (!q || (!q.current && q.tracks.length === 0)) {
       return interaction.reply({ content: 'Queue is empty.', flags: MessageFlags.Ephemeral });
     }
-    const lines = [];
-    if (q.current) lines.push(`▶️ **${q.current.title}**`);
-    q.tracks.forEach((t, i) => lines.push(`${i + 1}. ${t.title}`));
-    return interaction.reply(lines.join('\n').slice(0, 1900));
+    const e = new EmbedBuilder().setColor(BRAND).setTitle('🎵 Queue').setFooter({ text: 'audiomonkey' });
+    if (q.current) e.setDescription(`**Now playing**\n${q.current.title}`);
+    if (q.tracks.length) {
+      e.addFields({
+        name: 'Up next',
+        value: q.tracks.map((t, i) => `\`${i + 1}.\` ${t.title}`).join('\n').slice(0, 1024),
+      });
+    }
+    return interaction.reply({ embeds: [e] });
   }
 });
 
