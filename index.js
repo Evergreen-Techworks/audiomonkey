@@ -230,10 +230,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         guildId: interaction.guild.id,
         adapterCreator: interaction.guild.voiceAdapterCreator,
       });
+      connection.on('stateChange', (o, n) => console.log(`[voice] ${o.status} -> ${n.status}`));
+      connection.on('error', (e) => console.error('[voice] error:', e.message));
       connection.subscribe(q.player);
       try {
         await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-      } catch {
+      } catch (e) {
+        console.error('[voice] join failed:', e?.message, '| final state:', connection.state.status);
         connection.destroy();
         queues.delete(interaction.guild.id);
         return interaction.editReply('❌ Failed to join the voice channel.');
